@@ -105,6 +105,7 @@ class AdvantageEstimator(str, Enum):
     GPG = "gpg"
     RLOO_VECTORIZED = "rloo_vectorized"
     GRPO_VECTORIZED = "grpo_vectorized"
+    GPPO = "gppo"
 
 
 ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
@@ -353,6 +354,68 @@ def compute_grpo_vectorized_outcome_advantage(
             scalars = scores - mean_g[g]
         advantages = scalars.unsqueeze(-1) * response_mask
         return advantages, advantages
+
+
+@register_adv_est(AdvantageEstimator.GPPO)
+def compute_gppo_advantage(
+    token_level_rewards: torch.Tensor,
+    values: torch.Tensor,
+    response_mask: torch.Tensor,
+    config: Optional[AlgoConfig] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute advantage for G-PPO (Group PPO), combining PPO's value baseline with GRPO's
+    outcome reward broadcasting.
+
+    G-PPO uses:
+    - Broadcasted external reward R_ext (like GRPO)
+    - Value baseline V(s_{t-1}) for variance reduction (like PPO)
+    - Advantage: A_t = R_ext - V(s_{t-1}) for t > 0
+    - First response token (t=0) has no baseline, so it's masked out
+
+    Args:
+        token_level_rewards: `(torch.Tensor)`
+            shape is (bs, response_length). Sparse reward (typically only last token has reward).
+        values: `(torch.Tensor)`
+            shape is (bs, response_length). Value predictions V(s_t) for each token.
+        response_mask: `(torch.Tensor)`
+            shape is (bs, response_length). Mask for valid response tokens.
+        config: `(Optional[AlgoConfig])`
+            algorithm configuration object
+
+    Returns:
+        advantages: `(torch.Tensor)`
+            shape is (bs, response_length). A_t = R_ext - V(s_{t-1}), masked at t=0.
+        returns: `(torch.Tensor)`
+            shape is (bs, response_length). Broadcasted R_ext for BCE value loss target.
+    """
+    with torch.no_grad():
+        # Get the outcome reward (sum of sparse token rewards = final reward)
+        outcome_rewards = token_level_rewards.sum(dim=-1, keepdim=True)  # (bs, 1)
+
+        # Broadcast reward to all tokens
+        returns = outcome_rewards.expand_as(response_mask) * response_mask  # (bs, response_length)
+
+        # Shift values by 1: values_shifted[t] = values[t-1]
+        # For t=0, there's no previous value, so we use 0 (will be masked out anyway)
+        values_shifted = torch.zeros_like(values)
+        values_shifted[:, 1:] = values[:, :-1]  # values_shifted[t] = values[t-1] for t > 0
+
+        # Compute advantage: A_t = R_ext - V(s_{t-1})
+        advantages = returns - values_shifted
+
+        # Create mask that excludes the first response token (t=0 has no baseline)
+        gppo_mask = response_mask.clone()
+        # Find the first response token for each sequence and mask it out
+        # The first non-zero position in response_mask is the first response token
+        first_response_idx = response_mask.argmax(dim=-1)  # (bs,)
+        batch_indices = torch.arange(response_mask.shape[0], device=response_mask.device)
+        gppo_mask[batch_indices, first_response_idx] = 0
+
+        # Apply mask to advantages
+        advantages = advantages * gppo_mask
+
+    return advantages, returns
 
 
 @register_adv_est(AdvantageEstimator.GRPO_PASSK)  # or simply: @register_adv_est("grpo_passk")
@@ -1356,9 +1419,10 @@ def compute_value_loss(
     response_mask: torch.Tensor,
     cliprange_value: float,
     loss_agg_mode: str = "token-mean",
+    loss_type: str = "mse",
 ):
     """
-    Compute the clipped value-function loss for PPO.
+    Compute the value-function loss for PPO.
 
     Copied from https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py#L1151
 
@@ -1369,25 +1433,38 @@ def compute_value_loss(
             Old (baseline) values from the value head, shape (batch_size, response_length).
         returns (torch.FloatTensor):
             Ground-truth returns, shape (batch_size, response_length).
+            For MSE loss: continuous returns. For BCE loss: binary outcomes (0/1).
         response_mask (torch.Tensor):
             Mask indicating which tokens to include in the value loss calculation.
         cliprange_value (float):
-            Clip range for value prediction updates.
+            Clip range for value prediction updates (only used for MSE loss).
         loss_agg_mode (str, optional):
             Aggregation mode for `agg_loss`. Defaults to "token-mean".
+        loss_type (str, optional):
+            Type of value loss. Options: "mse" (clipped MSE, default), "bce" (binary cross-entropy).
+            BCE loss treats vpreds as logits and returns as binary targets (0/1).
 
     Returns:
         vf_loss (torch.FloatTensor):
             A scalar tensor containing the aggregated value-function loss.
         vf_clipfrac (float):
-            Fraction of elements where the clipped loss was used.
+            Fraction of elements where the clipped loss was used (0.0 for BCE loss).
     """
-    vpredclipped = verl_F.clip_by_value(vpreds, values - cliprange_value, values + cliprange_value)
-    vf_losses1 = (vpreds - returns) ** 2
-    vf_losses2 = (vpredclipped - returns) ** 2
-    clipped_vf_losses = torch.max(vf_losses1, vf_losses2)
-    vf_loss = 0.5 * agg_loss(loss_mat=clipped_vf_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-    vf_clipfrac = verl_F.masked_mean(torch.gt(vf_losses2, vf_losses1).float(), response_mask)
+    if loss_type == "bce":
+        # Binary cross-entropy loss: treats vpreds as logits, returns as binary targets (0/1)
+        vf_losses = torch.nn.functional.binary_cross_entropy_with_logits(
+            vpreds, returns, reduction="none"
+        )
+        vf_loss = agg_loss(loss_mat=vf_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+        vf_clipfrac = torch.tensor(0.0, device=vpreds.device)
+    else:
+        # Default: clipped MSE loss
+        vpredclipped = verl_F.clip_by_value(vpreds, values - cliprange_value, values + cliprange_value)
+        vf_losses1 = (vpreds - returns) ** 2
+        vf_losses2 = (vpredclipped - returns) ** 2
+        clipped_vf_losses = torch.max(vf_losses1, vf_losses2)
+        vf_loss = 0.5 * agg_loss(loss_mat=clipped_vf_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+        vf_clipfrac = verl_F.masked_mean(torch.gt(vf_losses2, vf_losses1).float(), response_mask)
     return vf_loss, vf_clipfrac
 
 

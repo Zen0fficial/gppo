@@ -79,6 +79,10 @@ cliprange_value: 0.5
 # Loss aggregation mode: "token-mean", "seq-mean-token-sum", or "seq-mean-token-mean"
 loss_agg_mode: ${oc.select:actor_rollout_ref.actor.loss_agg_mode,token-mean}
 
+# Value loss type: "mse" (clipped MSE, default), "bce" (binary cross-entropy)
+# BCE loss is recommended for G-PPO with binary outcome rewards (0/1)
+value_loss_type: ${oc.select:algorithm.value_loss_type,mse}
+
 # checkpoint configs
 checkpoint:
 

@@ -240,6 +240,17 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+    elif adv_estimator == AdvantageEstimator.GPPO:
+        # G-PPO: combines PPO's value baseline with GRPO's outcome reward broadcasting
+        # Advantage: A_t = R_ext - V(s_{t-1}) for t > 0, with first token masked
+        advantages, returns = core_algos.compute_gppo_advantage(
+            token_level_rewards=data.batch["token_level_rewards"],
+            values=data.batch["values"],
+            response_mask=data.batch["response_mask"],
+            config=config,
+        )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
