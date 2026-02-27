@@ -1,0 +1,182 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+
+\title{GRPO vs Our Method in \texttt{verl-gppo}}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\paragraph{Scope.}
+This note compares:
+\begin{itemize}
+\item \textbf{GRPO baseline}: \texttt{algorithm.adv\_estimator=grpo}.
+\item \textbf{Our method}: \texttt{algorithm.adv\_estimator=gppo} with \texttt{predict\_advantage\_head=true}.
+\end{itemize}
+The equations below are matched to the current code in
+\texttt{verl/trainer/ppo/core\_algos.py},
+\texttt{verl/trainer/ppo/ray\_trainer.py},
+and \texttt{verl/workers/actor/dp\_actor.py}.
+
+\paragraph{Shared setup.}
+For each sampled response \(i\), let \(g_i\) be its prompt id (\texttt{uid}), \(m_{i,t}\in\{0,1\}\) be response mask,
+and token rewards be \(r_{i,t}\). Define outcome reward
+\[
+R_i=\sum_t r_{i,t}.
+\]
+Rollouts are grouped by prompt id: \(S_g=\{i: g_i=g\}\).
+
+\paragraph{Comparison convention (important).}
+To make the ablation comparable in your intended way:
+\begin{itemize}
+\item \textbf{GRPO} uses \texttt{loss\_agg\_mode=seq-mean-token-mean}
+(classic per-sequence normalization).
+\item \textbf{Our method} uses \texttt{loss\_agg\_mode=seq-mean-token-sum}:
+token losses are summed within each sequence (no divide by token count), then averaged across sequences.
+\end{itemize}
+Let \(\ell_{i,t}\) be token-level PPO loss terms and \(T_i=\sum_t m_{i,t}\). Then
+\[
+\mathcal{L}_{\text{GRPO}}
+=
+\frac{1}{N_{\mathrm{valid}}}\sum_{i:\,T_i>0}
+\frac{1}{T_i}\sum_t m_{i,t}\,\ell_{i,t},
+\]
+\[
+\mathcal{L}_{\text{ours}}
+=
+\frac{1}{N_{\mathrm{valid}}}\sum_{i:\,T_i>0}
+\sum_t m_{i,t}\,\ell_{i,t}.
+\]
+Our method additionally replaces grouped sequence-level policy advantages with token-level predicted
+advantages from the actor head.
+
+\section*{1. GRPO (baseline)}
+For each group \(g\), compute group baseline statistics:
+\[
+\mu_g,\ \sigma_g \quad \text{from } \{R_i\}_{i\in S_g}.
+\]
+If \texttt{use\_ipw=true}, weights are proportional to \(1/\pi_i\), giving weighted \(\mu_g,\sigma_g\).
+Then scalar advantage is
+\[
+a_i^{\text{grpo}}=
+\begin{cases}
+\dfrac{R_i-\mu_{g_i}}{\sigma_{g_i}+\varepsilon}, & \text{if std-normalization on},\\[6pt]
+R_i-\mu_{g_i}, & \text{otherwise}.
+\end{cases}
+\]
+Token-level fields written to batch:
+\[
+A_{i,t}^{\text{grpo}}=a_i^{\text{grpo}}\,m_{i,t},
+\qquad
+\mathrm{Ret}_{i,t}^{\text{grpo}}=A_{i,t}^{\text{grpo}}.
+\]
+So in this implementation, \texttt{returns} are the same tensor as normalized/centered GRPO advantages.
+
+\section*{2. Our Method (GPPO + advantage head)}
+\paragraph{2.1 Grouped target (GPPO path).}
+GPPO also forms grouped scalar targets by prompt id:
+\[
+a_i^{\text{gppo}}=
+\begin{cases}
+\dfrac{R_i-\mu_{g_i}}{\sigma_{g_i}+\varepsilon}, & \text{if std-normalization on},\\[6pt]
+R_i-\mu_{g_i}, & \text{otherwise}.
+\end{cases}
+\]
+Then
+\[
+A_{i,t}^{\text{gppo}}=a_i^{\text{gppo}}\,m_{i,t},
+\qquad
+\mathrm{Ret}_{i,t}^{\text{gppo}}=R_i\,m_{i,t},
+\]
+and an extra scalar field is stored:
+\[
+\texttt{advantage\_targets}_i = a_i^{\text{gppo}}.
+\]
+
+\paragraph{2.2 Next-token aligned advantage head.}
+Let \(H_{i,t}\) be backbone hidden states. Policy and advantage use different hidden representations:
+\[
+h_{i,t}^{\pi}=H_{i,t},\qquad
+h_{i,t}^{A}=W_s H_{i,t}+b_s.
+\]
+Advantage branch predicts action-conditioned scores over vocabulary actions \(a\in\{1,\dots,V\}\):
+\[
+u_{i,t,a}=W_A[a]^\top h_{i,t}^{A}+b_A[a].
+\]
+For the sampled response token \(y_{i,t}\), the token advantage prediction is
+\[
+\tilde z_{i,t}=u_{i,t-1,y_{i,t}}\,m_{i,t},\quad t=1,\dots,T,
+\]
+which is next-token aligned (state \(t-1\) for action token \(t\)).
+Sequence prediction:
+\[
+\hat a_i=\sum_{t=1}^{T}\tilde z_{i,t}.
+\]
+Auxiliary regression loss:
+\[
+\mathcal{L}_{\text{adv}}=\frac{1}{B}\sum_{i=1}^{B}\left(\hat a_i-\texttt{advantage\_targets}_i\right)^2.
+\]
+Applied as \(\texttt{advantage\_loss\_coef}\cdot \mathcal{L}_{\text{adv}}\).
+
+\paragraph{2.3 PPO update in actor.}
+When \texttt{predict\_advantage\_head=true}, policy loss uses detached predicted token advantages:
+\[
+A_{i,t}^{\pi}=\operatorname{stopgrad}(\tilde z_{i,t}).
+\]
+Otherwise it uses \(A_{i,t}^{\text{gppo}}\).
+
+\paragraph{2.4 Update order.}
+Per training step in this codepath:
+\begin{enumerate}
+\item Compute rewards and grouped advantages.
+\item Update critic (if enabled).
+\item Update actor; if advantage head is enabled, actor first runs \(\mathcal{L}_{\text{adv}}\), then PPO policy loss.
+\end{enumerate}
+
+\section*{3. Side-by-side summary}
+\begin{center}
+\begin{tabular}{|p{0.23\linewidth}|p{0.34\linewidth}|p{0.34\linewidth}|}
+\hline
+\textbf{Item} & \textbf{GRPO baseline} & \textbf{Our method} \\
+\hline
+Grouping key & prompt id (\texttt{uid}) & prompt id (\texttt{uid}) \\
+\hline
+Scalar group target & centered (or std-normalized) \(R_i\) & same grouped target \\
+\hline
+\texttt{advantages} & \(a_i m_{i,t}\) & \(a_i m_{i,t}\) \\
+\hline
+\texttt{returns} & same as \texttt{advantages} & broadcast raw \(R_i\) \\
+\hline
+Extra target field & none & \(\texttt{advantage\_targets}=a_i\) \\
+\hline
+Extra actor loss & none & MSE on summed next-token-aligned action-conditioned scores \\
+\hline
+Policy advantage source & grouped target directly & detached head prediction (if enabled) \\
+\hline
+PPO loss aggregation & \texttt{seq-mean-token-mean} & \texttt{seq-mean-token-sum} \\
+\hline
+IPW baseline option & yes (\texttt{use\_ipw}) & no \\
+\hline
+Default critic need & no & yes in current \texttt{need\_critic} rule \\
+\hline
+\end{tabular}
+\end{center}
+
+\section*{4. Minimal ablation matrix}
+\begin{center}
+\begin{tabular}{|p{0.16\linewidth}|p{0.16\linewidth}|p{0.20\linewidth}|p{0.14\linewidth}|p{0.24\linewidth}|}
+\hline
+\textbf{Run} & \textbf{adv estimator} & \textbf{adv head} & \textbf{critic} & \textbf{loss agg mode} \\
+\hline
+GRPO baseline & \texttt{grpo} & false & false & \texttt{seq-mean-token-mean} \\
+\hline
+Our method & \texttt{gppo} & true & true & \texttt{seq-mean-token-sum} \\
+\hline
+\end{tabular}
+\end{center}
+
+\end{document}
